@@ -1,0 +1,1853 @@
+---
+title: "R ASSIGNMENT : JANE STREET MARKET PREDICTION EDA"
+author: "Abhishek Thomas"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc_float: true
+    df-print: kable
+    fontsize: 1.0em
+    embed-resources: true
+    number-sections: true
+    highlight-style: dracula
+---
+
+
+
+
+
+
+# Introduction
+
+## Goal of the Challenge:
+- Predict the value of **`responder_6`**, which represents an anonymized market response, for up to **six months into the future**.
+- The responder values are clipped between `-5` and `5`, where the magnitude indicates the **strength of the response**.
+- Predictions are made in **real-time** using a provided **evaluation API** that serves data timestep-by-timestep. But for this notebook we will try to replicate the data sets, test and evaluate a baseline model
+
+---
+
+## Overview of the Datasets:
+
+1. **`train.parquet`**:
+   - **Historical training data** with features and responder values.
+   - Contains **79 features (`feature_00` to `feature_78`)** representing market conditions.
+   - **9 responders (`responder_0` to `responder_8`)**, with `responder_6` being the target to predict.
+   - Indexed by **`date_id`** and **`time_id`** (representing unique timestamps).
+   - **`symbol_id`** indicates the financial instrument.
+
+2. **`test.parquet`**:
+   - A **mock test set** that represents the structure of the real-time test set.
+   - Only used to debug or verify the submission format.
+
+3. **`lags.parquet`**:
+   - Contains **lagged values** of the responders from the previous `date_id`.
+   - Provides the entire previous day's responder values at the first `time_id` of each new day.
+
+4. **`features.csv`**:
+   - Provides **metadata for the 79 features**, tagging each feature with binary tags (e.g., `tag_0`, `tag_1`) that describe their properties.
+
+5. **`responders.csv`**:
+   - Provides **metadata** about the 9 responders.
+
+6. **`sample_submission.csv`**:
+   - An example of the expected **submission format**, showing how your predictions should be structured.
+
+---
+
+## Key Points:
+- Each row in `train.parquet` corresponds to a **unique combination of `symbol_id`, `date_id`, and `time_id`**.
+- The **evaluation API** serves test data step-by-step and expects predictions at every timestep, but only predictions for the **private test set** are scored.
+- The **features** provide anonymized market signals, and the **responders** (especially `responder_6`) indicate what actions should be taken based on those signals.
+
+---
+
+## Notebook objective: 
+Explore all the datasets, do an EDA and engineer features to replicate the hackathon requirements, model and interpret. I have used **ChatGPT** in most of the ploting, data preparation and modelling
+
+# Imports
+
+
+
+```{r  message = F, warning = F}
+# Core tidyverse (includes ggplot2, dplyr, tidyr, and more)
+library(tidyverse)
+
+# Data handling
+library(arrow)
+library(data.table)
+
+# Visualization
+library(plotly)
+
+# Machine Learning packages
+# Note: These will be installed when needed
+# library(xgboost)
+# library(lightgbm)
+# library(catboost)
+
+# Documentation
+library(rmarkdown)
+```
+
+```{r}
+# When you need them:
+if (!require(xgboost)) install.packages("xgboost")
+if (!require(lightgbm)) install.packages("lightgbm")
+if (!require(catboost)) install.packages("catboost")
+```
+
+
+
+# Features.csv : EDA
+
+
+```{r warning = F}
+# Step 1: Load the features.csv file
+features <- read.csv("features.csv")
+
+# Display the dimensions
+dim(features)
+# Display the first 5 rows
+head(features, 5)
+
+# Step 2: Check for null values (NA) in each column
+na_info <- data.frame(
+  column = colnames(features),
+  na_count = colSums(is.na(features)),  # Number of missing values
+  na_percentage = colSums(is.na(features)) / nrow(features) * 100  # Percentage of missing values
+)
+print(na_info)
+
+# Step 3: Convert "true"/"false" to logical TRUE/FALSE if any tag-like columns exist
+features <- features %>%
+  mutate(across(starts_with("tag"), ~ . == "true", .names = "logical_{col}"))
+
+# Display structure after conversion
+str(features)
+
+# Step 4: Create the percentage table for TRUE/FALSE
+percentages_table <- features %>%
+  pivot_longer(cols = starts_with("logical_"), names_to = "feature_tag", values_to = "value") %>%
+  group_by(feature, feature_tag) %>%  # Group by feature and tag
+  summarise(
+    true_percentage = mean(value, na.rm = TRUE) * 100,   # Percentage of TRUE
+    false_percentage = (1 - mean(value, na.rm = TRUE)) * 100  # Percentage of FALSE
+  ) %>%
+  ungroup()
+
+# Display the first few rows of the percentage table
+head(percentages_table, 5)
+
+# Step 5: Create the interactive Plotly heatmap
+
+plot <- plot_ly(
+  data = percentages_table,
+  x = ~feature,
+  y = ~feature_tag,
+  z = ~true_percentage,
+  type = "heatmap",
+  colors = c("red", "green"),  # "red" for low true%, "green" for high
+  text = ~paste("True Percentage:", round(true_percentage, 2), "%"),
+  hoverinfo = "text"
+)
+
+plot <- plot %>%
+  layout(
+    title = list(text = "Interactive True-False Heatmap for Features"),
+    xaxis = list(title = "Features", tickangle = 90),
+    yaxis = list(title = "Tags"),
+    margin = list(l = 70, r = 50, t = 50, b = 100)
+  )
+
+plot  # Display the interactive plot
+
+
+```
+Tags 12, 13, and 14 are true for several features, but the majority of tags across the dataset are false
+
+
+# Responders.csv : EDA
+
+
+```{r warning = F}
+# Step 1: Load the responders.csv file
+responders <- read.csv("responders.csv")
+
+# Display the dimensions
+dim(responders)
+
+# Display the first 5 rows
+head(responders, 5)
+
+# Step 2: Check for null values (NA) in each column
+na_info <- data.frame(
+  column = colnames(responders),
+  na_count = colSums(is.na(responders)),  # Number of missing values
+  na_percentage = colSums(is.na(responders)) / nrow(responders) * 100  # Percentage of missing values
+)
+na_info
+
+# Step 3: Convert "true"/"false" to logical TRUE/FALSE
+responders <- responders %>%
+  mutate(across(starts_with("tag"), ~ . == "true"))
+
+# Display structure after conversion
+str(responders)
+
+# Step 4: Create the percentage table for TRUE/FALSE
+percentages_table <- responders %>%
+  pivot_longer(cols = starts_with("tag"), names_to = "tag", values_to = "value") %>%
+  group_by(responder, tag) %>%  # Group by responder and tag
+  summarise(
+    true_percentage = mean(value, na.rm = TRUE) * 100,   # Percentage of TRUE
+    false_percentage = (1 - mean(value, na.rm = TRUE)) * 100  # Percentage of FALSE
+  ) %>%
+  ungroup()
+
+# Step 5: Create the interactive Plotly heatmap
+
+plot <- plot_ly(
+  data = percentages_table,
+  x = ~responder,
+  y = ~tag,
+  z = ~true_percentage,
+  type = "heatmap",
+  colors = c("red", "green"),  # "red" for low true%, "green" for high
+  text = ~paste("True Percentage:", round(true_percentage, 2), "%"),
+  hoverinfo = "text"
+)
+
+plot <- plot %>%
+  layout(
+    title = list(text = "Interactive True-False Heatmap for Responders"),
+    xaxis = list(title = "Responders", tickangle = 90),
+    yaxis = list(title = "Tags"),
+    margin = list(l = 70, r = 50, t = 50, b = 100)
+  )
+
+plot  # Display the interactive plot
+
+
+```
+
+Responder 6 has the target variable as true for tag 3. Other responders associated with tag 3 include Responder 1 and Responder 4
+
+# Train.parquet : EDA
+
+
+
+```{r warning = F}
+
+# Define the directory containing parquet files
+parquet_dir <- "train.parquet"
+
+# Step 1: List all parquet files in the directory
+parquet_files <- list.files(parquet_dir, pattern = "part-.*\\.parquet", recursive = TRUE, full.names = TRUE)
+cat("Number of parquet files found:", length(parquet_files), "\n")
+
+# Initialize variables for final summary
+total_rows <- 0
+total_columns <- 0
+cols_100_na_all <- list()
+cols_75_na_all <- list()
+cols_50_na_all <- list()
+cols_25_na_all <- list()
+
+# Step 2: Process each parquet file
+for (file in parquet_files) {
+  cat("\nProcessing file:", file, "\n")
+  
+  tryCatch({
+    # Step 3: Read the parquet file
+    train <- read_parquet(file)
+    train <- as.data.frame(train)
+    head(train,3)
+    tail(train,3)
+    
+    # Step 4: Find original dimensions
+    original_dim <- dim(train)
+    cat("Original dimensions (rows, columns):", original_dim, "\n")
+    
+    # Update total rows and columns
+    total_rows <- total_rows + nrow(train)
+    total_columns <- ncol(train)  # Columns are the same across files
+    
+    # Step 5: Identify feature variables (columns starting with "feature_")
+    feature_columns <- grep("^feature_", colnames(train), value = TRUE)
+    feature_dim <- length(feature_columns)
+    cat("Number of feature variables:", feature_dim, "\n")
+    
+    # Step 6: Identify responder variables (columns starting with "responder_")
+    responder_columns <- grep("^responder_", colnames(train), value = TRUE)
+    responder_dim <- length(responder_columns)
+    cat("Number of responder variables:", responder_dim, "\n")
+    
+    # Step 7: Calculate missing value statistics for all columns
+    na_info <- train %>%
+      summarise(across(everything(), ~ sum(is.na(.)))) %>%
+      pivot_longer(everything(), names_to = "column", values_to = "na_count") %>%
+      mutate(na_percentage = na_count / nrow(train) * 100)
+    
+    # Step 8: Find columns with 100% NA values
+    cols_100_na <- na_info %>% filter(na_percentage == 100) %>% pull(column)
+    cat("Number of columns with 100% NA values:", length(cols_100_na), "\n")
+    if (length(cols_100_na) > 0) {
+      cat("Columns with 100% NA values:", paste(cols_100_na, collapse = ", "), "\n")
+      cols_100_na_all <- unique(c(cols_100_na_all, cols_100_na))
+    }
+    
+    # Step 9: Find columns with less than 75% NA values
+    cols_less_75_na <- na_info %>% filter(na_percentage < 75) %>% pull(column)
+    cat("Number of columns with less than 75% NA values:", length(cols_less_75_na), "\n")
+    if (length(cols_less_75_na) > 0) {
+      cat("Columns with less than 75% NA values:", paste(cols_less_75_na, collapse = ", "), "\n")
+      cols_75_na_all <- unique(c(cols_75_na_all, cols_less_75_na))
+    }
+    
+    # Step 10: Find columns with less than 50% NA values
+    cols_less_50_na <- na_info %>% filter(na_percentage < 50) %>% pull(column)
+    cat("Number of columns with less than 50% NA values:", length(cols_less_50_na), "\n")
+    if (length(cols_less_50_na) > 0) {
+      cat("Columns with less than 50% NA values:", paste(cols_less_50_na, collapse = ", "), "\n")
+      cols_50_na_all <- unique(c(cols_50_na_all, cols_less_50_na))
+    }
+    
+    # Step 11: Find columns with less than 25% NA values
+    cols_less_25_na <- na_info %>% filter(na_percentage < 25) %>% pull(column)
+    cat("Number of columns with less than 25% NA values:", length(cols_less_25_na), "\n")
+    if (length(cols_less_25_na) > 0) {
+      cat("Columns with less than 25% NA values:", paste(cols_less_25_na, collapse = ", "), "\n")
+      cols_25_na_all <- unique(c(cols_25_na_all, cols_less_25_na))
+    }
+    
+    # Step 12: Find missing value count and percentage for responder_6
+    if ("responder_6" %in% colnames(train)) {
+      responder_6_na_count <- sum(is.na(train$responder_6))
+      responder_6_na_percentage <- responder_6_na_count / nrow(train) * 100
+      cat("Missing value count for responder_6:", responder_6_na_count, "\n")
+      cat("Missing value percentage for responder_6:", responder_6_na_percentage, "%\n")
+    } else {
+      cat("responder_6 not found in this file.\n")
+    }
+    
+    # Step 13: Log the processed file
+    cat("EDA for ", file," completed.\n")
+    
+  }, error = function(e) {
+    cat("Error processing file:", file, "\n")
+    cat("Error message:", e$message, "\n")
+  })
+  
+  # Free up memory
+  rm(train)
+  gc()
+}
+
+# Step 14: Final summary
+#Final Summary Across All Files
+cat("Total rows and columns across all files:", total_rows,total_columns, "\n")
+
+
+cat("\nColumns with 100% NA values across all files:", length(cols_100_na_all), "\n")
+if (length(cols_100_na_all) > 0) {
+  cat("Names of columns with 100% NA values:", paste(cols_100_na_all, collapse = ", "), "\n")
+}
+
+cat("\nColumns with less than 75% NA values across all files:", length(cols_75_na_all), "\n")
+if (length(cols_75_na_all) > 0) {
+  cat("Names of columns with less than 75% NA values:", paste(cols_75_na_all, collapse = ", "), "\n")
+}
+
+cat("\nColumns with less than 50% NA values across all files:", length(cols_50_na_all), "\n")
+if (length(cols_50_na_all) > 0) {
+  cat("Names of columns with less than 50% NA values:", paste(cols_50_na_all, collapse = ", "), "\n")
+}
+
+cat("\nColumns with less than 25% NA values across all files:", length(cols_25_na_all), "\n")
+if (length(cols_25_na_all) > 0) {
+  cat("Names of columns with less than 25% NA values:", paste(cols_25_na_all, collapse = ", "), "\n")
+}
+
+# Final cleanup
+gc()
+```
+There are 10 training parquet files, each containing approximately 5 million rows and 92 columns. Several columns have missing values. Completely empty columns can be removed, while columns with partial missing values can be imputed with the median to keep the process simple and efficient. 
+
+## Sample train data
+
+To replicate the hackathon training dataset, I’m randomly sampling 50,000 rows from each parquet file. This approach reduces computation and makes it easier to reproduce results
+
+```{r warning = F}
+
+
+# Define the path
+path <- "./train.parquet"
+
+# Initialize an empty list to store the data frames
+samples <- list()
+
+# Define the number of rows to sample from each file
+sample_size <- 50000
+
+# Load data from each file and take a sample
+for (i in 0:9) {
+  file_path <- paste0(path, "/partition_id=", i, "/part-0.parquet")
+  
+  # Read the parquet file
+  part <- read_parquet(file_path)
+  
+  # Determine the number of rows in the file
+  n_rows <- nrow(part)
+  
+  # Calculate the number of rows to sample from this file
+  current_sample_size <- ifelse(n_rows >= sample_size, sample_size, n_rows)
+  
+  # Take a random sample
+  part_sample <- part %>% slice_sample(n = current_sample_size)
+  
+  # Add the sample to the list
+  samples[[i + 1]] <- part_sample
+}
+
+# Concatenate all samples into one data frame
+sample_df <- bind_rows(samples)
+
+# Round numeric columns to 1 decimal place
+#sample_df <- sample_df %>% mutate(across(where(is.numeric), ~ round(., )))
+
+# Print the resulting data frame
+head(sample_df, 5)
+
+# Print the dimensions of the data frame
+dim(sample_df)
+```
+
+
+```{r warning = F}
+# Save the resulting data frame as a Parquet file
+output_path <- "./Results/Data/train_sample_output.parquet"  # Define the output file path
+write_parquet(sample_df, output_path)
+
+# Print confirmation message
+cat("Data saved as Parquet file at:", output_path, "\n")
+
+
+```
+## Summary of Train sample
+```{r warning=F}
+
+# Generate a summary of the data frame
+summary(sample_df)
+
+
+```
+From this, I observe about 38 symbol_ids, 1,698 date_ids, and 967 time_ids, with weights ranging from ~0 to ~10. The responder values range between -5 and 5, while feature values span from 0 to 169. Since the data is encoded, interpreting the features and responders is challenging. However, after reviewing some notebooks, I understood that responders represent various signals linked to specific stocks, which are used for different types of decision-making.
+
+
+## Missing values
+
+```{r warning = F}
+
+# Step 1: Calculate the percentage of missing values in each column
+missing_percentage <- sample_df %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "Column", values_to = "Missing_Percentage")
+
+# Step 2: Display the missing percentage in a readable format
+
+#print(missing_percentage)
+
+# Optional: Sort by Missing_Percentage in descending order
+missing_percentage_sorted <- missing_percentage %>%
+  arrange(desc(Missing_Percentage))
+
+#sorted missing value percentage before imputation
+print(missing_percentage_sorted)
+
+# Step 3: Replace missing values by grouping by symbol_id and taking the median
+sample_df <- sample_df %>%
+  group_by(symbol_id) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  ungroup()
+
+# Step 4: If there are still missing values, replace them by grouping by date_id and taking the median
+sample_df <- sample_df %>%
+  group_by(date_id) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  ungroup()
+
+# Step 5: Check if there are still any missing values after imputation
+missing_percentage_after <- sample_df %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "Column", values_to = "Missing_Percentage")
+
+# Step 6: Display the percentage of missing values after imputation
+#print(missing_percentage_after)
+
+# Optional: Sort by Missing_Percentage in descending order
+missing_percentage_sorted <- missing_percentage_after %>%
+  arrange(desc(Missing_Percentage))
+
+#"Sorted missing percentages after imputation
+print(missing_percentage_sorted)
+
+
+```
+There are very less missing values (max ~31%), I have to decided to replace the median values by each symbol_id and then in case there still any missing values it would take the median of the date 
+
+## Train sample correlation heatmap 
+```{r}
+
+# Step 1: Get the names of all feature columns
+
+feature_cols <- grep("feature", names(sample_df), value = TRUE)
+
+# Step 3: Compute the correlation matrix
+
+cor_matrix <- cor(sample_df, use = "complete.obs")  # Handle missing values
+
+# Step 4: Filter the correlation matrix for values > 0.5
+
+cor_matrix_filtered <- cor_matrix
+cor_matrix_filtered[abs(cor_matrix) <= 0.5] <- NA  # Set correlations <= 0.5 to NA
+
+# Step 5: Remove rows and columns with all NA values
+
+all_na_cols <- colSums(is.na(cor_matrix_filtered)) == nrow(cor_matrix_filtered)
+all_na_rows <- rowSums(is.na(cor_matrix_filtered)) == ncol(cor_matrix_filtered)
+cor_matrix_filtered_clean <- cor_matrix_filtered[!all_na_rows, !all_na_cols]
+
+
+# Convert filtered correlation matrix to matrix format for Plotly
+z_mat <- as.matrix(cor_matrix_filtered_clean)
+x_labels <- colnames(z_mat)
+y_labels <- rownames(z_mat)
+
+
+# Create a text matrix for hover info (row, column, and correlation value)
+text_matrix <- matrix(nrow = nrow(z_mat), ncol = ncol(z_mat))
+
+for (i in seq_len(nrow(z_mat))) {
+  for (j in seq_len(ncol(z_mat))) {
+    text_matrix[i, j] <- paste0(
+      "<b>Row:</b> ", y_labels[i], "<br>",
+      "<b>Column:</b> ", x_labels[j], "<br>",
+      "<b>Correlation:</b> ", ifelse(is.na(z_mat[i, j]), "NA", round(z_mat[i, j], 2))
+    )
+  }
+}
+
+
+# Create annotations for in-cell numeric values
+annotations <- list()
+for (i in seq_len(nrow(z_mat))) {
+  for (j in seq_len(ncol(z_mat))) {
+    
+    # Skip annotation for NA cells if you prefer them blank
+    if (!is.na(z_mat[i, j])) {
+      annotations[[length(annotations) + 1]] <- list(
+        x = x_labels[j],
+        y = y_labels[i],
+        xref = "x",
+        yref = "y",
+        text = round(z_mat[i, j], 2),
+        showarrow = FALSE,
+        font = list(color = "black", size = 10)
+      )
+    }
+  }
+}
+
+
+# Plotly heatmap
+plot_ly(
+  x = x_labels,
+  y = y_labels,
+  z = z_mat,
+  type = "heatmap",
+  text = text_matrix,       # Hover text
+  hoverinfo = "text",       # Display only the text on hover
+  colorscale = list(        # Custom color scale (blue -> white -> red)
+    list(0.0, "blue"),
+    list(0.5, "yellow"),
+    list(1.0, "red")
+  ),
+  zmin = -1,
+  zmax = 1,
+  showscale = TRUE
+) %>%
+  layout(
+    title = "Correlation Heatmap of Feature Columns (|Correlation| > 0.5)",
+    xaxis = list(title = "Features"),
+    yaxis = list(title = "Features", autorange = "reversed"),  # Reverse to mimic matrix orientation
+    annotations = annotations  # In-cell numeric annotations
+  )
+
+```
+
+There are several highly correlated columns (correlation >90%), such as (feature70, feature12), (feature75, feature76), (feature14, feature69), and (feature12, feature67). This suggests that some variables might be derived from others or are very similar. Removing one variable from each pair can reduce the number of columns, simplify the data, and improve the modeling process
+
+
+## Analysis for a symbol_id 10
+
+### Responder 6
+```{r}
+
+# Assuming sample_df is your dataset
+# Add 'N' and 'id' columns to the dataset
+train <- sample_df %>%
+  mutate(N = row_number(), id = row_number())
+
+# Filter data for symbol_id == 10
+symbol_10_data <- train %>% filter(symbol_id == 10)
+
+# Extract 'id' and 'responder_6' for symbol_id == 10
+xx <- symbol_10_data$id
+yy <- symbol_10_data$responder_6
+
+# Create a plotly object
+p <- plot_ly() %>%
+  # Add trace for responder_6 (blue line)
+  add_trace(
+    x = ~xx,
+    y = ~yy,
+    type = "scatter",
+    mode = "lines",
+    name = "responder_6",
+    line = list(color = "blue", width = 1),
+    hoverinfo = "text",
+    text = ~paste("Time: ", xx, "<br>Responder 6: ", round(yy, 2))
+  ) %>%
+  layout(
+    title = list(
+      text = "<b>Returns: responder_6 (blue) with Zero Line (red)</b>",
+      x = 0.5,
+      y = 0.95,
+      font = list(size = 16, weight = "bold")
+    ),
+    xaxis = list(title = "Time", font = list(size = 12)),
+    yaxis = list(title = "Returns", font = list(size = 12)),
+    grid = list(color = "#DDDDDD", width = 0.8),
+    shapes = list(
+      list(
+        type = "line",
+        x0 = 0,
+        x1 = 1,
+        y0 = 0,
+        y1 = 0,
+        xref = "paper",
+        yref = "y",
+        line = list(color = "red", width = 1.2, dash = "solid")
+      )
+    ),
+    hovermode = "x unified",
+    legend = list(x = 1, y = 1, bgcolor = "rgba(255, 255, 255, 0.5)")
+  )
+
+# Display the plot
+p
+```
+Responder_6 (blue) shows high volatility, with returns often moving away from the Zero Line (red). This means it has big ups and downs, which could mean higher risk but also the chance for bigger rewards
+
+### All responders
+
+```{r}
+
+
+# Filter data for symbol_id == 10
+symbol_10_data <- sample_df %>% filter(symbol_id == 10)
+
+# Get the list of predictor columns (responders)
+predictor_cols <- grep("responder", colnames(symbol_10_data), value = TRUE)
+
+# Create an empty plotly object
+p <- plot_ly()
+
+# Add each responder's cumulative mean to the plot
+for (i in predictor_cols) {
+  # Calculate cumulative mean for each responder
+  cumulative_mean <- symbol_10_data %>%
+    group_by(date_id) %>%
+    summarise(mean_value = mean(.data[[i]], na.rm = TRUE)) %>%
+    mutate(cumulative_mean = cumsum(mean_value))
+  
+  # Add a trace for each responder
+  p <- p %>%
+    add_trace(
+      x = ~date_id,
+      y = ~cumulative_mean,
+      data = cumulative_mean,
+      type = "scatter",
+      mode = "lines",
+      name = i,
+      line = list(width = ifelse(i == "responder_6", 2.5, 1)),
+      color = I(ifelse(i == "responder_6", "red", sample(colors(), 1))),  # Random color for other responders
+      hoverinfo = "text",
+      text = ~paste("Responder: ", i, "<br>Value: ", round(cumulative_mean, 2))
+    )
+}
+
+# Add layout and annotations
+p <- p %>%
+  layout(
+    title = list(
+      text = "<b>Response time series over trade days</b><br>Responder 6 (red) and other responders",
+      x = 0.5,
+      y = 0.95,
+      font = list(size = 16)
+    ),
+    xaxis = list(title = "Trade days"),
+    yaxis = list(title = "Cumulative response"),
+    showlegend = TRUE,
+    legend = list(x = 1, y = 1, bgcolor = "rgba(255, 255, 255, 0.5)"),
+    hovermode = "x unified",
+    grid = list(color = "#DDDDDD", width = 0.7),
+    shapes = list(
+      list(
+        type = "line",
+        x0 = 0,
+        x1 = 1,
+        y0 = 0,
+        y1 = 0,
+        xref = "paper",
+        yref = "y",
+        line = list(color = "blue", width = 1, dash = "solid")
+      )
+    )
+  )
+
+# Display the plot
+p
+
+
+```
+Analyzing the line graph, we observe that all responders exhibit unique patterns, except for Responder 3, which closely mirrors Responder 6. The cumulative response shows a notable drop to approximately -9, with peaks reaching around 10
+
+### All features 
+
+Lets just visualize the distributions for all the feautres
+```{r warning=F}
+
+# Filter and reshape the data
+df_long <- sample_df %>%
+  filter(symbol_id == 10) %>%
+  select(starts_with("feature_")) %>%
+  pivot_longer(cols = everything(), 
+              names_to = "feature",
+              values_to = "value")
+
+# Create the plot
+plot_ly(data = df_long, 
+        y = ~value, 
+        x = ~feature, 
+        type = "box",
+        boxpoints = "outliers",
+        color = ~feature) %>%
+  layout(
+    title = "Feature Distribution for Symbol ID 10",
+    yaxis = list(title = "Value", 
+                 gridcolor = 'rgb(238, 238, 238)',
+                 zerolinecolor = 'rgb(238, 238, 238)',
+                 zerolinewidth = 2),
+    xaxis = list(title = "Features",
+                 gridcolor = 'rgb(238, 238, 238)',
+                 tickangle = 45),
+    paper_bgcolor = 'rgb(248, 248, 255)',
+    plot_bgcolor = 'rgb(248, 248, 255)',
+    showlegend = FALSE
+  )
+```
+"Pro Tip: Zoom in on each feature to explore the boxplot and identify outliers. The data reveals numerous outliers across the board, with most medians centered around 0. This indicates a wide range of variations and potential anomalies, offering deeper insights for detailed analysis and strategic adjustments
+
+## Understanding the Hackathon Metric: Weighted \( R^2 \)
+
+---
+
+Let us introduce the **weighted \( R^2 \)** metric, which is used to evaluate submissions in this competition. The formula for the weighted \( R^2 \) is given by:
+
+$$
+R^2 = 1 - \frac{\sum_{i=1}^n w_i (y_i - \hat{y}_i)^2}{\sum_{i=1}^n w_i y_i^2},
+$$
+
+where:
+- \( y_i \): The ground truth value of the target variable `responder_6` for the \( i \)-th sample.
+- \( \hat{y}_i \): The predicted value of `responder_6` for the \( i \)-th sample.
+- \( w_i \): The weight assigned to the \( i \)-th sample.
+- \( n \): The total number of samples.
+
+### Key Properties of the Weighted \( R^2 \)
+1. **Weighted Errors**: The squared errors \( (y_i - \hat{y}_i)^2 \) are weighted by \( w_i \), emphasizing samples with higher weights. This ensures that predictions for more important samples have a greater impact on the score.
+   
+2. **Zero-Mean Adjustment**: The denominator uses \( y_i^2 \) instead of the typical \( (y_i - \bar{y})^2 \), as the target distribution is already centered around zero. This simplifies the formula while maintaining its interpretability.
+
+3. **Interpretation**:
+   - \( R^2 = 1 \): Perfect predictions, meaning the model explains all the variance in the target.
+   - \( R^2 = 0 \): Predictions are no better than a constant (e.g., predicting zero for all samples).
+   - \( R^2 < 0 \): Predictions are worse than a constant, indicating poor model performance.
+
+### Why Weighted \( R^2 \) Matters
+The weighted \( R^2 \) metric is particularly suited for financial forecasting tasks because:
+ - It accounts for the varying importance of samples through weights, which is critical in financial applications where  certain observations may carry more significance.
+ - It penalizes large errors more heavily, ensuring that the model performs well even on challenging samples.
+ - It provides a clear, interpretable measure of model performance, making it easy to compare different approaches.
+
+---
+
+### Example Calculation
+Suppose we have the following data:
+- Ground truth values: \( y = [1, -2, 3, -4, 5] \)
+- Predicted values: \( \hat{y} = [1.1, -1.8, 2.9, -4.1, 4.8] \)
+- Weights: \( w = [0.1, 0.2, 0.3, 0.4, 0.5] \)
+
+The weighted \( R^2 \) score would be calculated as:
+1. Compute the weighted squared errors: \( w_i (y_i - \hat{y}_i)^2 \).
+2. Compute the weighted sum of squared ground truth values: \( w_i y_i^2 \).
+3. Plug these into the formula to get the final score.
+
+---
+
+
+
+
+```{r warning=F}
+
+
+# Assuming sample_df is already loaded in your environment
+# sample_df <- read.csv("path_to_your_dataset.csv")  # Uncomment if you need to load the dataset
+
+# 1. Understanding the Weight Distribution
+ggplot(sample_df, aes(x = weight)) +
+  geom_histogram(bins = 50, fill = "blue", color = "black") +
+  labs(title = "Distribution of Weights",
+       x = "Weight",
+       y = "Frequency") +
+  theme_minimal()
+
+# 2. Understanding the Target Variable Distribution
+ggplot(sample_df, aes(x = responder_6)) +
+  geom_histogram(bins = 50, fill = "green", color = "black") +
+  labs(title = "Distribution of Target Variable (responder_6)",
+       x = "responder_6",
+       y = "Frequency") +
+  theme_minimal()
+
+# 3. Calculating Weighted R^2 for Random Predictions
+set.seed(123)  # For reproducibility
+n_samples <- nrow(sample_df)
+random_predictions <- runif(n_samples, -5, 5)
+
+# Function to calculate weighted R^2
+weighted_r2 <- function(y_true, y_pred, weights) {
+  SS_res <- sum(weights * (y_true - y_pred)^2)
+  SS_tot <- sum(weights * y_true^2)
+  return(1 - (SS_res / SS_tot))
+}
+
+# Calculate weighted R^2 for random predictions
+random_r2 <- weighted_r2(sample_df$responder_6, random_predictions, sample_df$weight)
+cat("Weighted R^2 for random predictions:", random_r2, "\n")
+
+# 4. Calculating Weighted R^2 for Constant Predictions
+constant_predictions <- rep(0, n_samples)
+constant_r2 <- weighted_r2(sample_df$responder_6, constant_predictions, sample_df$weight)
+cat("Weighted R^2 for constant predictions (0):", constant_r2, "\n")
+
+
+# 5. Perfect Predictions (for reference)
+perfect_predictions <- sample_df$responder_6
+perfect_r2 <- weighted_r2(sample_df$responder_6, perfect_predictions, sample_df$weight)
+cat("Weighted R^2 for perfect predictions:", perfect_r2, "\n")
+
+# 6. Check each symbol_id and their weights
+# Group by symbol_id and calculate summary statistics
+weight_summary <- sample_df %>%
+  group_by(symbol_id) %>%
+  summarise(
+    min_weight = min(weight),
+    q25_weight = quantile(weight, 0.25),
+    median_weight = median(weight),
+    q75_weight = quantile(weight, 0.75),
+    max_weight = max(weight)
+  )
+
+# Filter for median weight > 4
+high_weight_symbols <- weight_summary %>%
+  filter(median_weight > 3.5)
+
+# Get count of filtered symbol_ids
+symbol_count <- nrow(high_weight_symbols)
+
+# Print results
+cat("Number of symbols with median weight > 4:", symbol_count, "\n\n")
+
+cat("Symbol IDs with median weight > 4:\n")
+print(high_weight_symbols$symbol_id)
+
+# Print detailed summary for these symbols
+print(high_weight_symbols)
+
+```
+Certain symbol_ids carry more weight than average. Focusing advanced machine learning and feature engineering efforts on these key symbol_ids can boost predictions and improve the weighted R², leading to better performance overall.
+
+
+# Feature engineering
+
+I’ve gained insights and performed feature engineering on the sample training data. Since the aim is to run a simple model on the actual dataset, I’m not removing any columns. Instead, I’ll add lag_1 features (using the last day of the date_id and symbol_id to create the lag) as outlined in the hackathon. Additionally, I’ll include feature tags and responder tags, which represent the means of features or responders marked as true for the respective tags. While creating lags, some rows will be removed due to the absence of prior values. For any remaining null values, I’ll apply forward fill, followed by backward fill, to handle them effectively
+```{r warning=F}
+
+
+# Configuration
+TARGET_COL <- "responder_6"
+#START_DATE_ID <- 0     
+VALID_RATIO <- 0.05      
+LAGGED_RESP_COLS <- paste0("responder_", 0:8)
+FEATURE_COLS <- paste0("feature_", sprintf("%02d", 0:78))
+
+# Read and preprocess data
+preprocess_data <- function(input_file) {
+    print("Starting preprocessing...")
+    
+    # Read data and metadata
+    print("Reading input files...")
+    sample_df <- read_parquet(input_file)
+    features_meta <- fread("features.csv")
+    responders_meta <- fread("responders.csv")
+    setDT(sample_df)
+    
+    print(sprintf("Initial shape: %d rows x %d cols", 
+                 nrow(sample_df), ncol(sample_df)))
+    
+    # Filter by date_id
+    #sample_df <- sample_df[date_id > START_DATE_ID]
+    #print(sprintf("Rows after date filter: %d", nrow(sample_df)))
+    
+    # Create lag features with fill strategy
+    print("Creating lag features...")
+    
+    # Create a copy for lag features
+    lag_dt <- copy(sample_df[
+        , c("date_id", "symbol_id", ..LAGGED_RESP_COLS)
+    ])
+    
+    # Print diagnostic info
+    print(sprintf("Number of unique symbols: %d", uniqueN(lag_dt$symbol_id)))
+    print(sprintf("Number of unique dates: %d", uniqueN(lag_dt$date_id)))
+    print(sprintf("Number of rows before aggregation: %d", nrow(lag_dt)))
+    
+    # Keep last observation per day-symbol
+    lag_dt <- lag_dt[, .SD[.N], by = .(date_id, symbol_id)]
+    
+    # Sort by date and symbol for proper filling
+    setorder(lag_dt, symbol_id, date_id)
+    
+    # Forward fill within groups
+    lag_dt[, (LAGGED_RESP_COLS) := lapply(.SD, function(x) nafill(x, type = "locf")), 
+           by = symbol_id,
+           .SDcols = LAGGED_RESP_COLS]
+    
+    # Backward fill for any remaining NAs
+    lag_dt[, (LAGGED_RESP_COLS) := lapply(.SD, function(x) nafill(x, type = "nocb")), 
+           by = symbol_id,
+           .SDcols = LAGGED_RESP_COLS]
+    
+    # Shift date_id for lagging
+    lag_dt[, date_id := date_id + 1L]
+    
+    # Print diagnostics
+    print(sprintf("Number of rows in lag_dt: %d", nrow(lag_dt)))
+    print(sprintf("Number of unique date_id, symbol_id combinations in lag_dt: %d", 
+                 uniqueN(lag_dt, by = c("date_id", "symbol_id"))))
+    
+    # Rename lag columns
+    setnames(lag_dt,
+             old = LAGGED_RESP_COLS,
+             new = paste0(LAGGED_RESP_COLS, "_lag_1"))
+    
+    # Merge with original data
+    print("Starting merge operation...")
+    
+    # For diagnostics before merge
+    print(sprintf("Original data rows: %d", nrow(sample_df)))
+    print(sprintf("Lag data rows: %d", nrow(lag_dt)))
+    
+    # Set keys for merge
+    setkeyv(lag_dt, c("date_id", "symbol_id"))
+    setkeyv(sample_df, c("date_id", "symbol_id"))
+    
+    # Perform merge that preserves all original rows
+    sample_df <- merge(sample_df, lag_dt, 
+                      by = c("date_id", "symbol_id"),
+                      all.x = TRUE)
+    
+    print(sprintf("Rows after merge: %d", nrow(sample_df)))
+    
+    # Remove any duplicate columns
+    duplicate_cols <- grep("^i\\.", names(sample_df), value = TRUE)
+    if (length(duplicate_cols) > 0) {
+        sample_df[, (duplicate_cols) := NULL]
+    }
+    
+    print(sprintf("Shape after adding lags: %d rows x %d cols",
+                 nrow(sample_df), ncol(sample_df)))
+    
+    # Create tag-based features
+    print("Creating tag-based features...")
+    
+    # For features
+    feature_tags <- names(features_meta)[grep("^tag_", names(features_meta))]
+    for(tag in feature_tags) {
+        tagged_features <- features_meta[get(tag) == TRUE, feature]
+        if(length(tagged_features) > 0) {
+            tag_cols <- intersect(tagged_features, names(sample_df))
+            if(length(tag_cols) > 0) {
+                sample_df[, paste0("feat_", tag, "_mean") := 
+                    rowMeans(.SD, na.rm = TRUE), .SDcols = tag_cols]
+                sample_df[, paste0("feat_", tag, "_sd") := 
+                    apply(.SD, 1, sd, na.rm = TRUE), .SDcols = tag_cols]
+            }
+        }
+    }
+    
+    # For responders (using lag_1 versions)
+    responder_tags <- names(responders_meta)[grep("^tag_", names(responders_meta))]
+    for(tag in responder_tags) {
+        tagged_responders <- paste0(
+            responders_meta[get(tag) == TRUE, responder],
+            "_lag_1"
+        )
+        if(length(tagged_responders) > 0) {
+            tag_cols <- intersect(tagged_responders, names(sample_df))
+            if(length(tag_cols) > 0) {
+                sample_df[, paste0("resp_", tag, "_lag1_mean") := 
+                    rowMeans(.SD, na.rm = TRUE), .SDcols = tag_cols]
+            }
+        }
+    }
+    
+    # Train/Test Split
+    print("Creating train/test split...")
+    setorder(sample_df, date_id, time_id)
+    n_total <- nrow(sample_df)
+    n_valid <- floor(n_total * VALID_RATIO)
+    n_train <- n_total - n_valid
+    
+    # Create splits
+    train_data <- sample_df[1:n_train]
+    test_data <- sample_df[(n_train + 1):n_total]
+    
+    # Handle missing values
+    print("Handling missing values in train data...")
+    
+    # Get numeric columns
+    numeric_cols <- names(train_data)[sapply(train_data, is.numeric)]
+    
+    # Sort by date_id and time_id for proper time-based filling
+    setorder(train_data, date_id, time_id)
+    
+    # Forward fill within groups
+    train_data[
+        , (numeric_cols) := lapply(.SD, function(x) nafill(x, type = "locf")),
+        .SDcols = numeric_cols,
+        by = symbol_id
+    ]
+    
+    # Backward fill for any remaining NAs
+    train_data[
+        , (numeric_cols) := lapply(.SD, function(x) nafill(x, type = "nocb")),
+        .SDcols = numeric_cols,
+        by = symbol_id
+    ]
+    
+    # Check remaining NAs
+    na_counts <- sapply(train_data, function(x) sum(is.na(x)))
+    if (sum(na_counts) > 0) {
+        print("Remaining NA counts by column:")
+        print(na_counts[na_counts > 0])
+    }
+    
+    # Print detailed summary
+    print("\nDetailed Summary:")
+    print(sprintf("Total rows: %d", n_total))
+    print(sprintf("Total columns: %d", ncol(sample_df)))
+    print(sprintf("Train rows: %d", nrow(train_data)))
+    print(sprintf("Test rows: %d", nrow(test_data)))
+    print(sprintf("Train date range: %d to %d", 
+                 min(train_data$date_id), max(train_data$date_id)))
+    print(sprintf("Test date range: %d to %d", 
+                 min(test_data$date_id), max(test_data$date_id)))
+    print(sprintf("Number of symbols in train: %d", 
+                 uniqueN(train_data$symbol_id)))
+    print(sprintf("Number of symbols in test: %d", 
+                 uniqueN(test_data$symbol_id)))
+    
+    # Return preprocessed datasets
+    return(list(train = train_data,
+        test = test_data
+    ))
+}
+
+# Save preprocessed data
+save_preprocessed_data <- function(data_list, output_dir) {
+    dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+    
+    # Save as parquet
+    print("Saving preprocessed data...")
+    write_parquet(as.data.frame(data_list$train), 
+                 file.path(output_dir, "train.parquet"))
+    write_parquet(as.data.frame(data_list$test), 
+                 file.path(output_dir, "test.parquet"))
+    
+    # Print file sizes
+    train_size <- file.size(file.path(output_dir, "train.parquet")) / 1024^2
+    test_size <- file.size(file.path(output_dir, "test.parquet")) / 1024^2
+    print(sprintf("train.parquet size: %.2f MB", train_size))
+    print(sprintf("test.parquet size: %.2f MB", test_size))
+}
+
+# Usage example:
+if (TRUE) {  # Set to TRUE to run
+    # Run preprocessing
+    results <- preprocess_data("./Results/Data/train_sample_output.parquet")
+    
+    # Save results
+    save_preprocessed_data(results, "./Results/Data")
+}
+```
+
+Checking for infinity values
+```{r}
+train_data <- read_parquet("./Results/Data/train.parquet")
+test_data <- read_parquet("./Results/Data/test.parquet")
+# Step 5: Check for infinite values in the dataset
+infinite_percentage <- train_data %>%
+  summarise(across(everything(), ~ mean(is.infinite(.) | is.infinite(-(.))) * 100)) %>%
+  pivot_longer(everything(), names_to = "Column", values_to = "Infinite_Percentage")
+
+# Step 6: Display the percentage of infinite values
+
+#  Sort by Infinite_Percentage in descending order
+infinite_percentage_sorted <- infinite_percentage %>%
+  arrange(desc(Infinite_Percentage))
+print(infinite_percentage_sorted)
+
+
+```
+
+There are no infinity values 
+
+# Modelling Baseline 
+
+Traditionally, tree-based models are a go-to in hackathons because of their effectiveness. In my approach, I plan to implement basic models like XGBoost, LightGBM, and CatBoost. I’ll evaluate these models using weighted metrics to ensure a fair assessment of their performance. I’ll also keep an eye out for overfitting and other potential issues to make sure the models are both accurate and reliable. My goal is to create strong, competitive solutions for the hackathon.
+
+
+
+## XGBOOST
+
+```{r warning=F}
+
+
+# Configuration
+TARGET_COL <- "responder_6"
+WEIGHT_COL <- "weight"
+N_FOLDS <- 5
+SEED <- 42
+
+get_feature_columns <- function(data) {
+    # Base features
+    base_features <- paste0("feature_", sprintf("%02d", 0:78))
+    
+    # Lag features for responders (including original lag_1 and new lags)
+    lag_features <- paste0("responder_", 0:8, "_lag_", c(1, 3, 6, 9, 12))
+    
+    # Rolling mean features
+    roll_resp_features <- paste0(paste0("responder_", 0:8), "_rollmean_", rep(c(3, 6, 9, 12), each=9))
+    roll_feat_features <- paste0(paste0("feature_", sprintf("%02d", 0:78)), "_rollmean_", rep(c(3, 6, 9, 12), each=79))
+    
+    # Tag-based features
+    tag_features <- names(data)[grep("^(feat|resp)_tag_", names(data))]
+    
+    # Combine all features
+    all_features <- c(base_features, lag_features, roll_resp_features, 
+                     roll_feat_features, tag_features)
+    
+    # Verify features exist in data
+    existing_features <- intersect(all_features, names(data))
+    
+    return(existing_features)
+}
+
+# Weighted R² function
+weighted_r2 <- function(y_true, y_pred, weights) {
+    numerator <- sum(weights * (y_true - y_pred)^2)
+    denominator <- sum(weights * (y_true^2)) + 1e-15
+    return(1 - numerator/denominator)
+}
+
+# Function to prepare training data
+prepare_training_data <- function(data, feature_cols) {
+    if (!is.data.table(data)) {
+        setDT(data)
+    }
+    
+    X <- as.matrix(data[, feature_cols, with=FALSE])
+    y <- data[[TARGET_COL]]
+    w <- data[[WEIGHT_COL]]
+    
+    return(list(X = X, y = y, w = w))
+}
+
+# Train XGBoost model with cross-validation
+train_simple_xgboost <- function(train_data, test_data, feature_cols) {
+    print("Preparing training data...")
+    train_prepared <- prepare_training_data(train_data, feature_cols)
+    test_prepared <- prepare_training_data(test_data, feature_cols)
+    
+    # XGBoost parameters - simplified
+    # nthread = parallel::detectCores() - 1 determines number of CPU threads to use
+    # If you have 8 CPU cores, it will use 7 threads, leaving 1 for other tasks
+    
+    params <- list(
+        objective = "reg:squarederror",  # For regression tasks
+        eval_metric = "rmse",            # Root Mean Square Error evaluation
+        eta = 0.1,                       # Learning rate
+        max_depth = 6,                   # Maximum tree depth
+        subsample = 0.8                  # Use 80% of data for each tree
+    )
+    
+    print("Creating DMatrix objects...")
+    dtrain <- xgb.DMatrix(
+        data = train_prepared$X,
+        label = train_prepared$y,
+        weight = train_prepared$w
+    )
+    
+    dtest <- xgb.DMatrix(
+        data = test_prepared$X,
+        label = test_prepared$y,
+        weight = test_prepared$w
+    )
+    
+    # Cross-validation
+    print("Starting cross-validation...")
+    cv_results <- xgb.cv(
+        params = params,
+        data = dtrain,
+        nrounds = 50,
+        nfold = N_FOLDS,
+        early_stopping_rounds = 20,
+        verbose = 1,
+        seed = SEED
+    )
+    
+    # Get best iteration
+    best_iter <- which.min(cv_results$evaluation_log$test_rmse_mean)
+    mean_cv_score <- min(cv_results$evaluation_log$test_rmse_mean)
+    
+    print(sprintf("Best CV RMSE: %f at iteration %d", mean_cv_score, best_iter))
+    
+    # Train final model
+    print("Training final model...")
+    model <- xgb.train(
+        params = params,
+        data = dtrain,
+        nrounds = best_iter,
+        watchlist = list(train = dtrain, valid = dtest),
+        verbose = 1
+    )
+    
+    # Make predictions
+    train_pred <- predict(model, dtrain)
+    test_pred <- predict(model, dtest)
+    
+    # Calculate metrics
+    train_r2 <- weighted_r2(train_prepared$y, train_pred, train_prepared$w)
+    test_r2 <- weighted_r2(test_prepared$y, test_pred, test_prepared$w)
+    
+    print("\nModel Performance:")
+    print(sprintf("Train Weighted R²: %.5f", train_r2))
+    print(sprintf("Test Weighted R²: %.5f", test_r2))
+    
+    # Overfitting check
+    if (train_r2 > test_r2 * 1.1) {
+        print("\nWarning: Model might be overfitting (train score substantially higher than test)")
+    } else if (train_r2 < test_r2 * 0.9) {
+        print("\nWarning: Unusual pattern - test score higher than train score")
+    } else {
+        print("\nModel seems well-balanced between train and test performance")
+    }
+    
+    # Feature importance
+    print("\nTop 10 Feature Importance:")
+    importance <- xgb.importance(feature_names = feature_cols, model = model)
+    #print(head(importance, 10))
+    
+    return(list(
+        model = model,
+        cv_results = cv_results,
+        feature_importance = importance,
+        scores = list(
+            train_r2 = train_r2,
+            test_r2 = test_r2,
+            cv_rmse = mean_cv_score
+        )
+    ))
+}
+
+# Usage example:
+if (TRUE) {
+    # Load preprocessed data
+    print("Reading data files...")
+    train_data <- read_parquet("./Results/Data/train.parquet")
+    test_data <- read_parquet("./Results/Data/test.parquet")
+    
+    # Define feature columns - including all features and lag-1 responders
+    feature_cols <- get_feature_columns(train_data)
+    
+    # Train model
+    set.seed(SEED)
+    model_results <- train_simple_xgboost(train_data, test_data, feature_cols)
+    
+    # Save model if needed
+    # save(model_results, file = "./Results/Models/simple_xgboost_model.RData")
+}
+```
+Based on the results, the model. The significant difference between the train and test scores suggests that the model might be overfitting. This means it’s performing well on the training data but struggling to generalize to unseen data
+
+## lightgbm
+```{r}
+
+# Configuration
+TARGET_COL <- "responder_6"
+WEIGHT_COL <- "weight"
+N_FOLDS <- 5
+SEED <- 42
+
+# Weighted R² function
+weighted_r2 <- function(y_true, y_pred, weights) {
+    numerator <- sum(weights * (y_true - y_pred)^2)
+    denominator <- sum(weights * (y_true^2)) + 1e-15
+    return(1 - numerator/denominator)
+}
+
+# Function to prepare training data
+prepare_training_data <- function(data, feature_cols) {
+    # Convert to data.table if not already
+    if (!is.data.table(data)) {
+        setDT(data)
+    }
+    
+    # Convert features to matrix
+    X <- as.matrix(data[, feature_cols, with=FALSE])
+    y <- data[[TARGET_COL]]
+    w <- data[[WEIGHT_COL]]
+    
+    return(list(
+        X = X,
+        y = y,
+        w = w
+    ))
+}
+
+# Train LightGBM model with cross-validation
+train_lightgbm_cv <- function(train_data, test_data, feature_cols) {
+    print("Preparing training data...")
+    train_prepared <- prepare_training_data(train_data, feature_cols)
+    test_prepared <- prepare_training_data(test_data, feature_cols)
+    
+    # LightGBM parameters
+    params <- list(
+        objective = "regression",
+        metric = "rmse",
+        learning_rate = 0.1,
+        num_leaves = 31,
+        max_depth = -1,  # -1 means no limit
+        feature_fraction = 0.8,
+        bagging_fraction = 0.8,
+        bagging_freq = 1,
+        verbose = -1
+    )
+    
+    print("Creating lgb.Dataset objects...")
+    dtrain <- lgb.Dataset(
+        data = train_prepared$X,
+        label = train_prepared$y,
+        weight = train_prepared$w
+    )
+    
+    dtest <- lgb.Dataset(
+        data = test_prepared$X,
+        label = test_prepared$y,
+        weight = test_prepared$w,
+        reference = dtrain
+    )
+    
+    # Cross-validation
+    print("Starting cross-validation...")
+    cv_results <- lgb.cv(
+        params = params,
+        data = dtrain,
+        nrounds = 200,
+        nfold = N_FOLDS,
+        early_stopping_rounds = 20,
+        stratified = FALSE,
+        verbose = 1
+    )
+    
+    # Get best iteration
+    best_iter <- cv_results$best_iter
+    mean_cv_score <- cv_results$best_score
+    
+    print(sprintf("Best CV RMSE: %f at iteration %d", 
+                 mean_cv_score, best_iter))
+    
+    # Train final model
+    print("Training final model...")
+    model <- lgb.train(
+        params = params,
+        data = dtrain,
+        nrounds = best_iter,
+        valids = list(valid = dtest)
+    )
+    
+    # Calculate weighted R² scores
+    train_pred <- predict(model, train_prepared$X)
+    test_pred <- predict(model, test_prepared$X)
+    
+    train_r2 <- weighted_r2(train_prepared$y, train_pred, train_prepared$w)
+    test_r2 <- weighted_r2(test_prepared$y, test_pred, test_prepared$w)
+    
+    print("\nModel Performance:")
+    print(sprintf("Train Weighted R²: %.5f", train_r2))
+    print(sprintf("Test Weighted R²: %.5f", test_r2))
+    
+    # Check for overfitting
+    if (train_r2 > test_r2 * 1.1) {
+        print("\nWarning: Model might be overfitting (train score substantially higher than test)")
+    } else if (train_r2 < test_r2 * 0.9) {
+        print("\nWarning: Unusual pattern - test score higher than train score")
+    } else {
+        print("\nModel seems well-balanced between train and test performance")
+    }
+    
+    # Feature importance
+    print("\nTop 10 Feature Importance:")
+    importance <- lgb.importance(model)
+    #print(head(importance, 10))
+    
+    return(list(
+        model = model,
+        cv_results = cv_results,
+        feature_importance = importance,
+        scores = list(
+            train_r2 = train_r2,
+            test_r2 = test_r2,
+            cv_rmse = mean_cv_score
+        )
+    ))
+}
+
+# Usage example:
+if (TRUE) {
+    # Load preprocessed data
+    print("Reading data files...")
+    train_data <- read_parquet("./Results/Data/train.parquet")
+    test_data <- read_parquet("./Results/Data/test.parquet")
+    
+    # Define feature columns
+    feature_cols <- get_feature_columns(train_data)
+    
+    # Train model
+    set.seed(SEED)
+    model_results <- train_lightgbm_cv(train_data, test_data, feature_cols)
+    
+    # Save model
+    #print("Saving model...")
+    #save(model_results, file = "./Results/Models/lightgbm_model.RData")
+}
+```
+The LightGBM model shows gap between the train and test scores indicates potential overfitting, where the model performs well on training data but struggles to generalize to new data
+
+
+## Catboost
+
+```{r}
+# Configuration
+TARGET_COL <- "responder_6"
+WEIGHT_COL <- "weight"
+N_FOLDS <- 5
+SEED <- 42
+
+# Weighted R² function for evaluation
+weighted_r2 <- function(y_true, y_pred, weights) {
+    numerator <- sum(weights * (y_true - y_pred)^2)
+    denominator <- sum(weights * (y_true - mean(y_true))^2) + 1e-15
+    return(1 - numerator/denominator)
+}
+
+# Function to prepare training data
+prepare_training_data <- function(data, feature_cols) {
+    if (!is.data.table(data)) {
+        setDT(data)
+    }
+    
+    X <- data[, feature_cols, with=FALSE]
+    y <- data[[TARGET_COL]]
+    w <- data[[WEIGHT_COL]]
+    
+    return(list(
+        X = X,
+        y = y,
+        w = w
+    ))
+}
+
+# Train CatBoost model with manual cross-validation
+train_catboost_cv <- function(train_data, test_data, feature_cols) {
+    print("Preparing training data...")
+    train_prepared <- prepare_training_data(train_data, feature_cols)
+    test_prepared <- prepare_training_data(test_data, feature_cols)
+    
+    # Create indices for cross-validation
+    n <- nrow(train_prepared$X)
+    fold_indices <- sample(rep(1:N_FOLDS, length.out = n))
+    cv_r2_scores <- numeric(N_FOLDS)
+    
+    # CatBoost parameters
+    params <- list(
+        iterations = 1000,
+        learning_rate = 0.1,
+        depth = 6,
+        loss_function = 'RMSE',
+        random_seed = SEED,
+        od_type = 'Iter',
+        od_wait = 20,
+        verbose = 100
+    )
+    
+    print("Starting cross-validation...")
+    for(fold in 1:N_FOLDS) {
+        print(sprintf("\nFold %d/%d", fold, N_FOLDS))
+        
+        # Split data for this fold
+        is_val <- fold_indices == fold
+        train_idx <- !is_val
+        val_idx <- is_val
+        
+        # Create train/val pools for this fold
+        fold_train_pool <- catboost.load_pool(
+            data = train_prepared$X[train_idx,],
+            label = train_prepared$y[train_idx],
+            weight = train_prepared$w[train_idx]
+        )
+        
+        fold_val_pool <- catboost.load_pool(
+            data = train_prepared$X[val_idx,],
+            label = train_prepared$y[val_idx],
+            weight = train_prepared$w[val_idx]
+        )
+        
+        # Train model for this fold
+        model <- catboost.train(
+            learn_pool = fold_train_pool,
+            test_pool = fold_val_pool,
+            params = params
+        )
+        
+        # Get predictions for validation set
+        val_pred <- catboost.predict(model, fold_val_pool)
+        
+        # Calculate weighted R² for this fold
+        fold_r2 <- weighted_r2(
+            train_prepared$y[val_idx],
+            val_pred,
+            train_prepared$w[val_idx]
+        )
+        
+        cv_r2_scores[fold] <- fold_r2
+        print(sprintf("Fold %d Weighted R²: %.5f", fold, fold_r2))
+    }
+    
+    # Calculate mean CV score
+    mean_cv_r2 <- mean(cv_r2_scores)
+    print(sprintf("\nMean CV Weighted R²: %.5f", mean_cv_r2))
+    
+    print("\nTraining final model...")
+    # Create full training pool
+    train_pool <- catboost.load_pool(
+        data = train_prepared$X,
+        label = train_prepared$y,
+        weight = train_prepared$w
+    )
+    
+    test_pool <- catboost.load_pool(
+        data = test_prepared$X,
+        label = test_prepared$y,
+        weight = test_prepared$w
+    )
+    
+    # Train final model
+    final_model <- catboost.train(
+        learn_pool = train_pool,
+        test_pool = test_pool,
+        params = params
+    )
+    
+    # Make predictions
+    train_pred <- catboost.predict(final_model, train_pool)
+    test_pred <- catboost.predict(final_model, test_pool)
+    
+    # Calculate weighted R² scores
+    train_r2 <- weighted_r2(train_prepared$y, train_pred, train_prepared$w)
+    test_r2 <- weighted_r2(test_prepared$y, test_pred, test_prepared$w)
+    
+    print("\nModel Performance:")
+    print(sprintf("Train Weighted R²: %.5f", train_r2))
+    print(sprintf("Test Weighted R²: %.5f", test_r2))
+    
+    if (train_r2 > test_r2 * 1.1) {
+        print("\nWarning: Model might be overfitting (train score substantially higher than test)")
+    } else if (train_r2 < test_r2 * 0.9) {
+        print("\nWarning: Unusual pattern - test score higher than train score")
+    } else {
+        print("\nModel seems well-balanced between train and test performance")
+    }
+    
+    print("\nTop 20 Feature Importance:")
+    importance <- catboost.get_feature_importance(final_model, type = 'FeatureImportance')
+    feature_importance <- data.frame(
+        Feature = feature_cols,
+        Importance = importance
+    )
+    feature_importance <- feature_importance[order(-feature_importance$Importance), ]
+    print(head(feature_importance, 20))
+    
+    return(list(
+        model = final_model,
+        cv_r2_scores = cv_r2_scores,
+        feature_importance = feature_importance,
+        scores = list(
+            train_r2 = train_r2,
+            test_r2 = test_r2,
+            cv_r2 = mean_cv_r2
+        )
+    ))
+}
+
+# Usage example:
+if (TRUE) {
+    print("Reading data files...")
+    train_data <- read_parquet("./Results/Data/train.parquet")
+    test_data <- read_parquet("./Results/Data/test.parquet")
+    
+    # Get feature columns
+    feature_cols <- grep("^(feature|responder.*_lag_1|feature_tag)", 
+                        names(train_data), value = TRUE)
+    print("Number of features:")
+    print(length(feature_cols))
+    print("Sample feature names:")
+    print(head(feature_cols, 10))
+    
+    # Train model
+    set.seed(SEED)
+    model_results <- train_catboost_cv(train_data, test_data, feature_cols)
+    
+    print("\nFinal Model Performance:")
+    print(sprintf("CV R²: %.5f", model_results$scores$cv_r2))
+    print(sprintf("Train R²: %.5f", model_results$scores$train_r2))
+    print(sprintf("Test R²: %.5f", model_results$scores$test_r2))
+}
+
+```
+The CatBoost baseline model shows that the model has limited predictive power, as all R² values are relatively low. The close proximity of the CV, train, and test scores indicates that overfitting might not be a significant issue, but the model’s overall performance needs improvement
+
+# Hyper parameter tuning
+```{r}
+# Configuration
+TARGET_COL <- "responder_6"
+WEIGHT_COL <- "weight"
+SEED <- 42
+
+# Weighted R² function
+weighted_r2 <- function(y_true, y_pred, weights) {
+    numerator <- sum(weights * (y_true - y_pred)^2)
+    denominator <- sum(weights * (y_true^2)) + 1e-15
+    return(1 - numerator/denominator)
+}
+
+tune_catboost <- function(train_data, test_data, feature_cols) {
+    # Prepare data
+    train_pool <- catboost.load_pool(
+        data = as.matrix(train_data[, feature_cols, with=FALSE]),
+        label = train_data[[TARGET_COL]],
+        weight = train_data[[WEIGHT_COL]]
+    )
+    
+    test_pool <- catboost.load_pool(
+        data = as.matrix(test_data[, feature_cols, with=FALSE]),
+        label = test_data[[TARGET_COL]],
+        weight = test_data[[WEIGHT_COL]]
+    )
+    
+    # Base parameters
+    base_params <- list(
+        iterations = 50,           # Set to 50 iterations
+        loss_function = "RMSE",
+        eval_metric = "RMSE",
+        random_seed = SEED,
+        verbose = 0,
+        early_stopping_rounds = 10  # Added early stopping
+    )
+    
+    # Grid search parameters
+    param_grid <- expand.grid(
+        depth = c(4, 6),
+        learning_rate = c(0.05, 0.1)
+    )
+    
+    # Grid search with cross-validation
+    best_score <- Inf
+    best_params <- NULL
+    
+    for(i in 1:nrow(param_grid)) {
+        current_params <- c(base_params, list(
+            depth = param_grid$depth[i],
+            learning_rate = param_grid$learning_rate[i]
+        ))
+        
+        # Cross validation
+        cv_results <- catboost.cv(
+            pool = train_pool,
+            params = current_params,
+            fold_count = 5,
+            partition_random_seed = SEED
+        )
+        
+        score <- min(cv_results$test_RMSE_mean)
+        print(sprintf(
+            "depth: %d, lr: %.3f, RMSE: %.5f", 
+            param_grid$depth[i], 
+            param_grid$learning_rate[i], 
+            score
+        ))
+        
+        if(score < best_score) {
+            best_score <- score
+            best_params <- current_params
+        }
+    }
+    
+    print("\nBest parameters:")
+    print(sprintf("depth: %d, learning_rate: %.3f", 
+                 best_params$depth, 
+                 best_params$learning_rate))
+    
+    # Train final model with best parameters
+    model <- catboost.train(
+        learn_pool = train_pool,
+        test_pool = test_pool,
+        params = best_params
+    )
+    
+    # Calculate metrics
+    train_pred <- catboost.predict(model, train_pool)
+    test_pred <- catboost.predict(model, test_pool)
+    
+    train_r2 <- weighted_r2(train_data[[TARGET_COL]], train_pred, train_data[[WEIGHT_COL]])
+    test_r2 <- weighted_r2(test_data[[TARGET_COL]], test_pred, test_data[[WEIGHT_COL]])
+    
+    print(sprintf("\nFinal Metrics:"))
+    print(sprintf("Train Weighted R²: %.5f", train_r2))
+    print(sprintf("Test Weighted R²: %.5f", test_r2))
+    
+    return(list(
+        model = model,
+        best_params = best_params,
+        scores = list(
+            train_r2 = train_r2,
+            test_r2 = test_r2,
+            best_cv_rmse = best_score
+        )
+    ))
+}
+
+# Usage:
+if (TRUE) {
+    library(catboost)
+    
+    # Load data
+    train_data <- read_parquet("./Results/Data/train.parquet")
+    test_data <- read_parquet("./Results/Data/test.parquet")
+    
+    # Get features
+    feature_cols <- get_feature_columns(train_data)
+    
+    # Train and tune model
+    set.seed(SEED)
+    results <- tune_catboost(train_data, test_data, feature_cols)
+}
+```
+
+Among the models I tested, CatBoost provided the highest score with the least overfitting, which is why I chose it as the preferred model. After performing hyperparameter tuning, I’ve managed to further reduce overfitting. . While the scores are still relatively low, the gap between the train and test scores has narrowed, indicating better generalization. This improvement makes the CatBoost model more reliable for predictions, and I’ll continue refining it to enhance performance further
+
+# Interpretability
+
+ploting the feature importance
+
+
+```{r warning=F}
+library(plotly)
+library(dplyr)
+
+# Get feature importance from CatBoost model
+importance_scores <- catboost.get_feature_importance(
+    model = results$model,
+    type = 'FeatureImportance'
+)
+
+# Create dataframe with feature names and importance scores
+importance_df <- data.frame(
+    Feature = feature_cols,
+    Importance = importance_scores
+) %>%
+    arrange(desc(Importance)) %>%
+    head(20)  # Get top 20 features
+
+# Create vertical bar plot
+plot_ly(data = importance_df, 
+        y = ~reorder(Feature, Importance),  # reorder features by importance
+        x = ~Importance, 
+        type = 'bar',
+        orientation = 'h',            # horizontal bars
+        marker = list(color = 'rgb(55, 83, 109)')) %>%
+    layout(title = 'Top 20 Most Important Features',
+           yaxis = list(title = '',    # Feature names will be shown on y-axis
+                       tickangle = 0),  # Horizontal text for feature names
+           xaxis = list(title = 'Feature Importance Score'),
+           margin = list(l = 200,      # Increased left margin for feature names
+                        r = 20, 
+                        t = 60, 
+                        b = 40),
+           showlegend = FALSE) %>%
+    layout(autosize = T,
+           height = 800)  # Make plot taller to accommodate all features
+
+# Print importance scores
+```
+
+We observe that Feature 6 has high feature importance and is one of the most critical variables for the model. The other features, while still contributing, have significantly lower importance. This suggests that Feature 6 plays a key role in driving predictions and is definitely essential to retain in the model. Moving forward, I’ll focus on optimizing the use of this feature while exploring ways to enhance the contribution of the other variables to improve overall model performance.
+
+
+
+# Final Thoughts
+The hackathon leaderboard's top 5 participants achieved a final weighted score of ~0.01 on the real-time live set. This notebook was a replication or trial run inspired by the actual Jane Street Hackathon 2024. While this was a practice attempt, I plan to make an official submission next time and aim for a winning position.
+
+Here are a few ideas I believe could help improve the weighted metric scores:
+ - **Feature Engineering**: Implement more lag values, rolling means, and remove correlated variables to enhance model performance.
+ - **Symbol-Level Modeling**: Predict for each symbol_id individually, as some symbols carry more weight than others. This could significantly boost scores.
+ - **Improved Validation Strategy**: Refine the validation approach to better replicate the test set, ensuring experiments are as close to real-time conditions as possible.
+
+A big thank you to the professor for your invaluable guidance throughout this project. Your feedback on this work would be greatly appreciated. This project gave me the time to explore the R world and Jane street :D
+
+
